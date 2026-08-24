@@ -1,4 +1,4 @@
-"""FormaAI ByteDance custom nodes (Seedream image + Seedance video).
+"""ByteDance custom nodes (Seedream image + Seedance video).
 
 Registered through the ComfyUI v3 extension entrypoint. Requires a recent
 ComfyUI that exposes `comfy_api.latest`.

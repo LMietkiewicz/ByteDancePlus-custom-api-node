@@ -1,0 +1,2 @@
+# torch, numpy, pillow, requests ship with ComfyUI already.
+byteplus-python-sdk-v2==3.0.58
