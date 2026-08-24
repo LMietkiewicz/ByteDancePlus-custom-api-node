@@ -1,15 +1,22 @@
 """Small helpers for the ByteDance nodes.
 
 These are the ~10-20% of Comfy's partner node worth keeping: tensor <-> image
-conversion, downloads, and the model lists. Everything talks base64 data URIs so
-there is no upload/hosting step (video references are the one exception -- the API
-only accepts a URL for those).
+conversion, downloads, and the model lists.
+
+Images are sent inline as base64 data URIs, so there is no upload/hosting step.
+Two exceptions, both imposed by the API: reference *videos* must be a public
+URL, and generated images come back as short-lived URLs we fetch immediately
+(`response_format="url"` -- cheaper than round-tripping base64 through the SDK;
+`image_result_to_tensor` still handles `b64_json` as a fallback).
 """
 
 import base64
 import io
 import logging
+import os
+import uuid
 
+import folder_paths
 import numpy as np
 import requests
 import torch
@@ -19,14 +26,18 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model lists. These are the BytePlus model IDs; edit to match what is actually
-# activated on your ModelArk account (each model is activated + billed separately).
-# Order = dropdown order; first entry is the default.
+# activated on your ModelArk account (each model is activated + billed
+# separately). Order = dropdown order; first entry is the default.
+#
+# The IDs are dated and account-specific, so both nodes also expose a
+# `model_override` string that wins when non-empty -- a stale list here should
+# never make a model unreachable.
 # ---------------------------------------------------------------------------
 SEEDREAM_MODELS = [
     "dola-seedream-5-0-pro-260628",
-    "seedream-5-0-260128",       # 5.0 lite
+    "seedream-5-0-260128",  # 5.0 lite
     "seedream-4-5-251128",
-    "seedream-4-0-250828"
+    "seedream-4-0-250828",
 ]
 
 SEEDANCE_MODELS = [
@@ -36,8 +47,42 @@ SEEDANCE_MODELS = [
     "dreamina-seedance-2-0-mini-260615",
     "seedance-1-5-pro-251215",
     "seedance-1-0-pro-250528",
-    "seedance-1-0-pro-fast-251015"
+    "seedance-1-0-pro-fast-251015",
 ]
+
+# Presets for the Seedream `size` field. "2K"/"4K" let the model pick the aspect
+# from the prompt; explicit WxH pins it (and avoids mixed-size batches).
+SIZE_PRESETS = [
+    "2K",
+    "4K",
+    "1K",
+    "2048x2048",
+    "2304x1728",
+    "1728x2304",
+    "2560x1440",
+    "1440x2560",
+]
+
+# Input + output images in a single Seedream request.
+SEEDREAM_TOTAL_IMAGE_LIMIT = 15
+
+# Seconds, by model family. Substring match against the model ID; edit as
+# BytePlus ships new families. Falls back to the widest range we know of.
+DURATION_LIMITS = {
+    "seedance-1": (3, 12),
+    "seedance-2": (4, 30),
+}
+DEFAULT_DURATION_LIMITS = (3, 30)
+
+# The API accepts URLs only for reference video, and caps the count.
+MAX_REFERENCE_VIDEOS = 3
+
+
+def duration_limits(model: str) -> tuple[int, int]:
+    for prefix, limits in DURATION_LIMITS.items():
+        if prefix in model:
+            return limits
+    return DEFAULT_DURATION_LIMITS
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +92,11 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
     if image.dim() == 4:
         image = image[0]
     arr = (image.detach().cpu().clamp(0, 1).numpy() * 255.0).round().astype(np.uint8)
-    mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
-    pil = Image.fromarray(arr, mode)
-    return pil.convert("RGB") if mode == "RGBA" else pil
+    if arr.shape[-1] == 4:
+        # The ModelArk image endpoints take RGB; alpha is dropped, not used as a mask.
+        logger.warning("Input image has an alpha channel; dropping it (the API takes RGB only).")
+        return Image.fromarray(arr, "RGBA").convert("RGB")
+    return Image.fromarray(arr, "RGB")
 
 
 def tensor_to_data_uri(image: torch.Tensor, fmt: str = "PNG") -> str:
@@ -57,6 +104,17 @@ def tensor_to_data_uri(image: torch.Tensor, fmt: str = "PNG") -> str:
     _to_pil(image).save(buf, format=fmt)
     mime = "image/png" if fmt.upper() == "PNG" else "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def single_image_data_uri(image: torch.Tensor, name: str) -> str:
+    """For inputs that mean exactly one image -- refuse a batch instead of
+    silently using frame 0."""
+    if image.dim() == 4 and image.shape[0] > 1:
+        raise ValueError(
+            f"`{name}` takes a single image, but got a batch of {image.shape[0]}. "
+            "Split the batch upstream."
+        )
+    return tensor_to_data_uri(image)
 
 
 def batch_to_data_uris(image) -> list[str]:
@@ -90,14 +148,38 @@ def image_result_to_tensor(item) -> torch.Tensor:
     raise RuntimeError("Image response item had neither `url` nor `b64_json`.")
 
 
-def stack_or_first(tensors: list[torch.Tensor]) -> torch.Tensor:
+def stack_images(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate into one IMAGE batch.
+
+    ComfyUI IMAGE batches must share a shape, but a sequential Seedream batch
+    can come back with mixed sizes. Rather than discard images you have already
+    paid for, pad each onto the largest canvas (centred, black). Pin an explicit
+    WxH `size` to avoid this entirely.
+    """
     if len(tensors) == 1:
         return tensors[0]
-    if len({t.shape for t in tensors}) == 1:
+
+    shapes = {(t.shape[1], t.shape[2]) for t in tensors}
+    if len(shapes) == 1:
         return torch.cat(tensors, dim=0)
-    # A batch can come back with mixed sizes; ComfyUI IMAGE batches must match.
-    logger.warning("Seedream batch returned mixed sizes; returning the first image only.")
-    return tensors[0]
+
+    max_h = max(t.shape[1] for t in tensors)
+    max_w = max(t.shape[2] for t in tensors)
+    logger.warning(
+        "Seedream batch returned mixed sizes %s; padding all to %dx%d so none are dropped. "
+        "Use an explicit WxH size to avoid this.",
+        sorted(shapes),
+        max_h,
+        max_w,
+    )
+    padded = []
+    for t in tensors:
+        h, w = t.shape[1], t.shape[2]
+        canvas = torch.zeros((1, max_h, max_w, t.shape[3]), dtype=t.dtype)
+        top, left = (max_h - h) // 2, (max_w - w) // 2
+        canvas[:, top : top + h, left : left + w, :] = t
+        padded.append(canvas)
+    return torch.cat(padded, dim=0)
 
 
 def make_seq_options(max_images: int):
@@ -107,6 +189,7 @@ def make_seq_options(max_images: int):
 
         return SequentialImageGenerationOptions(max_images=max_images)
     except Exception:  # SDK layout differs -> plain dict still serializes fine
+        logger.debug("SequentialImageGenerationOptions unavailable; sending a dict.", exc_info=True)
         return {"max_images": max_images}
 
 
@@ -129,11 +212,6 @@ def _video_from_file_cls():
 
 
 def download_video(url: str):
-    import os
-    import uuid
-
-    import folder_paths
-
     video_from_file = _video_from_file_cls()
     out_dir = folder_paths.get_temp_directory()
     os.makedirs(out_dir, exist_ok=True)
