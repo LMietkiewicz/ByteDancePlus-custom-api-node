@@ -205,6 +205,8 @@ class SeedanceVideoNode(IO.ComfyNode):
                     "ratio",
                     options=["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
                     default="16:9",
+                    tooltip="Ignored when first_frame is connected — the output aspect follows "
+                    "that image. 'adaptive' lets the model pick from the prompt.",
                 ),
                 IO.Int.Input(
                     "duration",
@@ -332,18 +334,25 @@ class SeedanceVideoNode(IO.ComfyNode):
                 {"type": "video_url", "video_url": {"url": url}, "role": "reference_video"}
             )
 
+        task_kwargs = dict(
+            model=model,
+            content=content,
+            generate_audio=generate_audio,
+            resolution=resolution,
+            duration=duration,
+            seed=seed,
+            watermark=watermark,
+        )
+        # With a first frame (or first+last), the output aspect follows the image and the
+        # API rejects `ratio` outright -- InvalidParameter.TaskTypeConstraint.
+        if first_frame is None:
+            task_kwargs["ratio"] = ratio
+        elif ratio != "adaptive":
+            logger.info("Ignoring ratio=%s; output aspect follows the first_frame image.", ratio)
+
         _progress(node_id, f"Seedance: submitting to {model}...")
         create = await asyncio.to_thread(
-            lambda: client.content_generation.tasks.create(
-                model=model,
-                content=content,
-                generate_audio=generate_audio,
-                resolution=resolution,
-                ratio=ratio,
-                duration=duration,
-                seed=seed,
-                watermark=watermark,
-            )
+            lambda: client.content_generation.tasks.create(**task_kwargs)
         )
 
         video_url = await cls._poll(client, create.id, node_id)
